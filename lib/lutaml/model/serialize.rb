@@ -362,6 +362,7 @@ module Lutaml
                     end
 
             value = normalize_xml_value(value, rule, attr, options)
+            attr&.validate_cardinality!(value, rule)
             rule.deserialize(instance, value, attributes, self)
           end
 
@@ -395,7 +396,8 @@ module Lutaml
 
             value = apply_child_mappings(value, rule.child_mappings)
             value = attr.cast(value, format)
-
+            value = normalize_key_value_formats_value(value, rule, attr)
+            attr&.validate_cardinality!(value)
             rule.deserialize(instance, value, attributes, self)
           end
 
@@ -425,6 +427,11 @@ module Lutaml
             :xml,
             options,
           )
+        end
+
+        def normalize_key_value_formats_value(value, _rule, attr, _options = {})
+          value = value.first if !attr.collection? && value.is_a?(Enumerable) && value.count == 1
+          value
         end
 
         def cast_value?(attr, rule)

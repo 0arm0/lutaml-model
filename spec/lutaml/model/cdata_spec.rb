@@ -15,7 +15,7 @@ module CDATA
 
   class Alpha < Lutaml::Model::Serializable
     attribute :element1, :string
-    attribute :element2, :string
+    attribute :element2, :string, collection: true
     attribute :element3, :string
     attribute :beta, Beta
 

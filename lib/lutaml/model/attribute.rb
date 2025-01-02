@@ -202,6 +202,15 @@ module Lutaml
         end
       end
 
+      def validate_cardinality!(value, mapping_rule = nil)
+        return true if mapping_rule&.content_mapping?
+        if !collection? && value.is_a?(Array) && value.count > 1
+          raise Lutaml::Model::CardinalityError.new(name, 1, value.count)
+        end
+
+        true
+      end
+
       def serialize(value, format, options = {})
         if value.is_a?(Array)
           value.map do |v|
