@@ -42,6 +42,7 @@ class RenderNil < Lutaml::Model::Serializable
     map "clay_type", to: :clay_type, render_nil: false
     map "glaze", to: :glaze, render_nil: true
     map "dimensions", to: :dimensions, render_nil: false
+    map "render_nil_nested", to: :render_nil_nested, render_nil: false
   end
 
   toml do
@@ -59,8 +60,10 @@ RSpec.describe RenderNil do
       clay_type: nil,
       glaze: nil,
       dimensions: nil,
+      render_nil_nested: RenderNilNested.new,
     }
   end
+
   let(:model) { described_class.new(attributes) }
 
   it "serializes to JSON with render_nil option" do
@@ -68,7 +71,6 @@ RSpec.describe RenderNil do
       name: nil,
       clay_type: nil,
       glaze: nil,
-      dimensions: [],
     }.to_json
 
     expect(model.to_json).to eq(expected_json)
@@ -113,7 +115,6 @@ RSpec.describe RenderNil do
       ---
       name:
       glaze:
-      dimensions: []
     YAML
 
     generated_yaml = model.to_yaml.strip

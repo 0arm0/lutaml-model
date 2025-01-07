@@ -21,6 +21,7 @@ module Lutaml
 
       def self.included(base)
         base.extend(ClassMethods)
+        base.initialize_attrs(base)
       end
 
       module ClassMethods
@@ -28,14 +29,18 @@ module Lutaml
 
         def inherited(subclass)
           super
+          subclass.initialize_attrs(self)
+        end
 
-          @mappings ||= {}
-          @attributes ||= {}
+        def included(base)
+          base.extend(ClassMethods)
+          base.initialize_attrs(self)
+        end
 
-          subclass.instance_variable_set(:@attributes,
-                                         Utils.deep_dup(@attributes))
-          subclass.instance_variable_set(:@mappings, Utils.deep_dup(@mappings))
-          subclass.instance_variable_set(:@model, subclass)
+        def initialize_attrs(source_class)
+          @mappings = Utils.deep_dup(source_class.instance_variable_get(:@mappings)) || {}
+          @attributes = Utils.deep_dup(source_class.instance_variable_get(:@attributes)) || {}
+          instance_variable_set(:@model, self)
         end
 
         def model(klass = nil)
@@ -81,14 +86,102 @@ module Lutaml
           attr = Attribute.new(name, type, options)
           attributes[name] = attr
 
-          define_method(name) do
-            instance_variable_get(:"@#{name}")
-          end
+          if attr.enum?
+            add_enum_methods_to_model(
+              model,
+              name,
+              options[:values],
+              collection: options[:collection],
+            )
+          else
+            define_method(name) do
+              instance_variable_get(:"@#{name}")
+            end
 
-          define_method(:"#{name}=") do |value|
-            value_set_for(name)
-            instance_variable_set(:"@#{name}", attr.cast_value(value))
+            define_method(:"#{name}=") do |value|
+              value_set_for(name)
+              instance_variable_set(:"@#{name}", attr.cast_value(value))
+            end
           end
+        end
+
+        def add_enum_methods_to_model(klass, enum_name, values, collection: false)
+          add_enum_getter_if_not_defined(klass, enum_name, collection)
+          add_enum_setter_if_not_defined(klass, enum_name, values, collection)
+
+          return unless values.all?(::String)
+
+          values.each do |value|
+            Utils.add_method_if_not_defined(klass, "#{value}?") do
+              curr_value = public_send(:"#{enum_name}")
+
+              if collection
+                curr_value.include?(value)
+              else
+                curr_value == value
+              end
+            end
+
+            Utils.add_method_if_not_defined(klass, value.to_s) do
+              public_send(:"#{value}?")
+            end
+
+            Utils.add_method_if_not_defined(klass, "#{value}=") do |val|
+              value_set_for(enum_name)
+              enum_vals = public_send(:"#{enum_name}")
+
+              enum_vals = if !!val
+                            if collection
+                              enum_vals << value
+                            else
+                              [value]
+                            end
+                          elsif collection
+                            enum_vals.delete(value)
+                            enum_vals
+                          else
+                            []
+                          end
+
+              instance_variable_set(:"@#{enum_name}", enum_vals)
+            end
+
+            Utils.add_method_if_not_defined(klass, "#{value}!") do
+              public_send(:"#{value}=", true)
+            end
+          end
+        end
+
+        def add_enum_getter_if_not_defined(klass, enum_name, collection)
+          Utils.add_method_if_not_defined(klass, enum_name) do
+            i = instance_variable_get(:"@#{enum_name}") || []
+
+            if !collection && i.is_a?(Array)
+              i.first
+            else
+              i.uniq
+            end
+          end
+        end
+
+        def add_enum_setter_if_not_defined(klass, enum_name, _values, collection)
+          Utils.add_method_if_not_defined(klass, "#{enum_name}=") do |value|
+            value = [value] unless value.is_a?(Array)
+
+            value_set_for(enum_name)
+
+            if collection
+              curr_value = public_send(:"#{enum_name}")
+
+              instance_variable_set(:"@#{enum_name}", curr_value + value)
+            else
+              instance_variable_set(:"@#{enum_name}", value)
+            end
+          end
+        end
+
+        def enums
+          attributes.select { |_, attr| attr.enum? }
         end
 
         Lutaml::Model::Config::AVAILABLE_FORMATS.each do |format|
@@ -135,7 +228,7 @@ module Lutaml
             end
           end
 
-          define_method(:"as_#{format}") do |instance|
+          define_method(:"as_#{format}") do |instance, options = {}|
             if instance.is_a?(Array)
               return instance.map { |item| public_send(:"as_#{format}", item) }
             end
@@ -147,7 +240,7 @@ module Lutaml
 
             return instance if format == :xml
 
-            hash_representation(instance, format)
+            hash_representation(instance, format, options)
           end
         end
 
@@ -161,12 +254,12 @@ module Lutaml
         def hash_representation(instance, format, options = {})
           only = options[:only]
           except = options[:except]
-          mappings = mappings_for(format).mappings
+          mappings = mappings_for(format).mappings.uniq(&:id)
 
           mappings.each_with_object({}) do |rule, hash|
             name = rule.to
             next if except&.include?(name) || (only && !only.include?(name))
-            next if !rule.render_default? && instance.using_default?(rule.to)
+            next if !rule.custom_methods[:to] && (!rule.render_default? && instance.using_default?(rule.to))
 
             next handle_delegate(instance, rule, hash, format) if rule.delegate
 
@@ -176,15 +269,17 @@ module Lutaml
 
             value = instance.send(name)
 
-            next if value.nil? && !rule.render_nil
-
             attribute = attributes[name]
 
-            hash[rule.from.to_s] = if rule.child_mappings
-                                     generate_hash_from_child_mappings(value, rule.child_mappings)
-                                   else
-                                     attribute.serialize(value, format, options)
-                                   end
+            value = if rule.child_mappings
+                      generate_hash_from_child_mappings(value, rule.child_mappings)
+                    else
+                      attribute.serialize(value, format, options)
+                    end
+
+            next if Utils.blank?(value) && !rule.render_nil
+
+            hash[rule.from.to_s] = value
           end
         end
 
@@ -194,37 +289,11 @@ module Lutaml
           return if value.nil? && !rule.render_nil
 
           attribute = instance.send(rule.delegate).class.attributes[name]
-          hash[rule.from] = attribute.serialize(value, format)
+          hash[rule.from.to_s] = attribute.serialize(value, format)
         end
 
         def mappings_for(format)
           mappings[format] || default_mappings(format)
-        end
-
-        def attr_value(attrs, name, attr_rule)
-          value = if attrs.key?(name.to_sym)
-                    attrs[name.to_sym]
-                  elsif attrs.key?(name.to_s)
-                    attrs[name.to_s]
-                  else
-                    attr_rule.default
-                  end
-
-          if attr_rule.collection? || value.is_a?(Array)
-            (value || []).map do |v|
-              if v.is_a?(Hash)
-                attr_rule.type.new(v)
-              else
-                # TODO: This code is problematic because Type.cast does not know
-                # about all the types.
-                Lutaml::Model::Type.cast(v, attr_rule.type)
-              end
-            end
-          else
-            # TODO: This code is problematic because Type.cast does not know
-            # about all the types.
-            Lutaml::Model::Type.cast(value, attr_rule.type)
-          end
         end
 
         def default_mappings(format)
@@ -325,8 +394,7 @@ module Lutaml
           mappings = mappings_for(:xml).mappings
 
           if doc.is_a?(Array)
-            raise "May be `collection: true` is" \
-                  "missing for #{self} in #{options[:caller_class]}"
+            raise "May be `collection: true` is missing for #{self} in #{options[:caller_class]}"
           end
 
           if instance.respond_to?(:ordered=) && doc.is_a?(Lutaml::Model::MappingHash)
@@ -344,23 +412,25 @@ module Lutaml
           end
 
           defaults_used = []
+          element_found_for = {}
 
           mappings.each do |rule|
+            next if element_found_for[rule.id]
             raise "Attribute '#{rule.to}' not found in #{self}" unless valid_rule?(rule)
 
             attr = attribute_for_rule(rule)
-
             value = if rule.raw_mapping?
                       doc.node.inner_xml
                     elsif rule.content_mapping?
                       doc[rule.content_key]
                     elsif doc.key_exist?(rule.namespaced_name(options[:default_namespace]))
+                      element_found_for[rule.id] = true
+                      defaults_used.delete(rule.to)
                       doc.fetch(rule.namespaced_name(options[:default_namespace]))
                     else
                       defaults_used << rule.to
                       attr&.default || rule.to_value_for(instance)
                     end
-
             value = normalize_xml_value(value, rule, attr, options)
             attr&.validate_cardinality!(value, rule)
             rule.deserialize(instance, value, attributes, self)
@@ -375,20 +445,27 @@ module Lutaml
 
         def apply_hash_mapping(doc, instance, format, _options = {})
           mappings = mappings_for(format).mappings
+          element_found_for = {}
           mappings.each do |rule|
+            next if element_found_for[rule.id]
             raise "Attribute '#{rule.to}' not found in #{self}" unless valid_rule?(rule)
 
             attr = attribute_for_rule(rule)
 
-            value = if doc.key?(rule.name.to_s) || doc.key?(rule.name.to_sym)
-                      doc[rule.name.to_s] || doc[rule.name.to_sym]
+            value = if doc.key?(rule.name.to_s)
+                      element_found_for[rule.id] = true
+                      doc[rule.name.to_s]
+                    elsif doc.key?(rule.name.to_sym)
+                      element_found_for[rule.id] = true
+                      doc[rule.name.to_sym]
                     else
                       attr&.default
                     end
 
-            if rule.custom_methods[:from]
+            if rule.using_custom_methods?
               if Utils.present?(value)
                 value = new.send(rule.custom_methods[:from], instance, value)
+                element_found_for[rule.id] = true
               end
 
               next
@@ -486,7 +563,7 @@ module Lutaml
 
         self.class.attributes.each do |name, attr|
           value = if attrs.key?(name) || attrs.key?(name.to_s)
-                    self.class.attr_value(attrs, name, attr)
+                    attr_value(attrs, name, attr)
                   else
                     using_default_for(name)
                     attr.default
@@ -497,7 +574,35 @@ module Lutaml
             value = []
           end
 
-          instance_variable_set(:"@#{name}", self.class.ensure_utf8(value))
+          default = using_default?(name)
+          public_send(:"#{name}=", self.class.ensure_utf8(value))
+          using_default_for(name) if default
+        end
+      end
+
+      def attr_value(attrs, name, attr_rule)
+        value = if attrs.key?(name.to_sym)
+                  attrs[name.to_sym]
+                elsif attrs.key?(name.to_s)
+                  attrs[name.to_s]
+                else
+                  attr_rule.default
+                end
+
+        if attr_rule.collection? || value.is_a?(Array)
+          (value || []).map do |v|
+            if v.is_a?(Hash)
+              attr_rule.type.new(v)
+            else
+              # TODO: This code is problematic because Type.cast does not know
+              # about all the types.
+              Lutaml::Model::Type.cast(v, attr_rule.type)
+            end
+          end
+        else
+          # TODO: This code is problematic because Type.cast does not know
+          # about all the types.
+          Lutaml::Model::Type.cast(value, attr_rule.type)
         end
       end
 
@@ -544,6 +649,14 @@ module Lutaml
 
       def key_value(hash, key)
         hash[key.to_sym] || hash[key.to_s]
+      end
+
+      def pretty_print_instance_variables
+        (instance_variables - %i[@using_default]).sort
+      end
+
+      def to_yaml_hash
+        self.class.as_yaml(self)
       end
 
       Lutaml::Model::Config::AVAILABLE_FORMATS.each do |format|
